@@ -1,21 +1,21 @@
-# Plan — AI Director
+# Plan y estado — Algunos Indios AI Director
 
-> Placeholder. The full implementation plan is being prepared and will be dropped in
-> here verbatim (or linked from here) before development starts.
+Este repositorio comenzó como un esqueleto. La primera implementación utilizable está en la raíz: `backend/`, `frontend/`, `tests/`, `INICIAR.bat` y `README.md`. `src/.gitkeep` queda únicamente como vestigio del esqueleto inicial; no se usa para ejecutar el proyecto.
 
-## Sections the plan is expected to cover
+## Fases entregadas
 
-- [ ] Scope and target use cases
-- [ ] Architecture (ingest → analysis → decision → output)
-- [ ] Source / scene model (OBS integration, camera inputs, overlays)
-- [ ] Decision engine (rules, model-driven or hybrid)
-- [ ] Tech stack and runtime requirements
-- [ ] Milestones and deliverables
-- [ ] Testing and acceptance criteria
-- [ ] Deployment and operations
+1. **Base:** FastAPI local, panel HTML/CSS/JS sin Node, OBS WebSocket v5 y adaptador simulado.
+2. **Automático:** selección ponderada, memoria, duraciones, planificación cancelable, pausa por intervención externa, perfiles persistentes.
+3. **Interfaz:** monitor en tiempo real por WebSocket, edición de escenas, historial y simulador de 20 cambios.
+4. **DeepSeek experimental:** peticiones reales a Chat Completions con metadatos, JSON validado, modo recomendación, timeout y fallback.
+5. **Verificación:** pruebas pytest con OBS y HTTP simulados, smoke HTTP/WebSocket y navegador local. Consulta `INFORME_ENTREGA.md`.
 
-## Open questions
+## Validación en entorno de producción pendiente
 
-- Target output: OBS Studio control, headless renderer, or both?
-- Latency budget for cut decisions.
-- Local-only inference vs. cloud API calls.
+- Prueba supervisada con OBS real, tanto con modo estudio activado como desactivado, y una Stream Deck real.
+- Prueba en Windows del doble clic de `INICIAR.bat` y de Credential Manager.
+- Prueba con una API key real de DeepSeek; el modelo no recibe vídeo ni audio.
+
+## Extensiones futuras
+
+Los contratos de decisión permiten añadir proveedores de metadatos de audio/vídeo, detección de voz o músicos, reconocimiento de secciones musicales y zoom dinámico sin modificar la política básica de validación y cortes. Ninguna de esas capacidades de análisis está presente en el MVP.

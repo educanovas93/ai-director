@@ -1,35 +1,30 @@
-# --- OS ---
-.DS_Store
-Thumbs.db
-
-# --- Editors ---
-.vscode/
-.idea/
-*.swp
-
-# --- Env / secrets ---
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-
-# --- Python ---
+# Dependencias y artefactos locales
+.venv/
 __pycache__/
 *.py[cod]
-.venv/
-venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-
-# --- Node ---
-node_modules/
-dist/
-build/
+.coverage
+htmlcov/
 *.log
 
-# --- Project artifacts ---
-/recordings/
-/out/
-/tmp/
+# Credenciales, estado de sesión y configuración privada
+.env
+.env.*
+!.env.example
+settings.json
+config.json
+data/*
+!data/.gitkeep
+*.sqlite
+*.sqlite3
+*.db
+*.pem
+*.key
+
+# Sistema operativo / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
