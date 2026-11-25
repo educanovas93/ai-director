@@ -2,7 +2,7 @@
   'use strict';
 
   const $ = (selector, root = document) => root.querySelector(selector);
-  const state = { status: null, config: null, scenes: [], profiles: [], ws: null, retry: null, statusTimer: null, history: [], scenesRevision: null };
+  const state = { status: null, config: null, scenes: [], profiles: [], aiModels: [], aiCatalogWarning: '', ws: null, retry: null, statusTimer: null, history: [], scenesRevision: null };
   const labels = { automatic: 'Automático', ai: 'Con IA', running: 'En directo', paused: 'En pausa', stopped: 'Detenido', idle: 'En espera', start: 'Iniciado', pause: 'Pausado', resume: 'Reanudado', stop: 'Detenido' };
   const categories = { general: 'General', voice: 'Voz', guitar: 'Guitarra', bass: 'Bajo', drums: 'Batería', zoom: 'Detalle', multi: 'Múltiple', other: 'Otra' };
   const label = value => labels[String(value || '').toLowerCase()] || String(value || '—');
@@ -32,7 +32,9 @@
     }
     if (!response.ok) {
       const detail = data && (data.detail || data.error || data.message);
-      throw new Error(typeof detail === 'string' ? detail : `Error ${response.status} al comunicarse con el servidor.`);
+      const message = typeof detail === 'string' ? detail : detail && typeof detail === 'object'
+        ? [detail.message, detail.hint].filter(Boolean).join(' — ') : `Error ${response.status} al comunicarse con el servidor.`;
+      throw new Error(message);
     }
     return data;
   }
@@ -141,6 +143,19 @@
     }
   }
 
+  function updateSceneCard(scene) {
+    const card = [...document.querySelectorAll('.scene-card')].find(node => node.dataset.sceneId === String(scene.id));
+    if (card) {
+      const fields = card.querySelectorAll('.scene-meta span');
+      if (fields[0]) fields[0].textContent = categories[scene.category] || scene.category || 'Sin categoría';
+      if (fields[1]) fields[1].textContent = `Peso ${scene.weight}`;
+      card.classList.toggle('missing', !!scene.missing);
+    }
+    const enabled = state.scenes.filter(item => item.enabled && !item.missing).length;
+    setText('#scene-summary', `${state.scenes.length} escenas · ${enabled} disponibles`);
+    updateSceneCurrent();
+  }
+
   function renderScenes(scenes) {
     state.scenes = Array.isArray(scenes) ? scenes : [];
     const grid = $('#scene-grid'); grid.replaceChildren();
@@ -161,18 +176,18 @@
       const take = el('button', 'button button-small button-secondary', '↗  Cortar a escena');
       take.type = 'button'; take.disabled = !!scene.missing; take.dataset.takeScene = String(scene.id);
       actions.append(take); card.append(actions);
-      const details = el('details', 'scene-details');
-      details.append(el('summary', '', 'Ajustar escena'));
+      const details = el('div', 'scene-details');
+      details.append(el('h4', 'scene-settings-title', 'Ajustes de escena'));
       const form = el('form', 'scene-form'); form.dataset.sceneForm = String(scene.id);
-      form.append(numberField('Peso', 'weight', scene.weight, 0, 'any'));
-      form.append(categoryField(scene.category));
-      form.append(numberField('Mínimo (s)', 'min_seconds', scene.min_seconds, 1, 'any'));
-      form.append(numberField('Máximo (s)', 'max_seconds', scene.max_seconds, 1, 'any'));
       const toggle = el('label', 'toggle-line');
       const toggleText = el('span'); toggleText.append(el('strong', '', 'Escena habilitada'));
       const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.name = 'enabled'; checkbox.checked = !!scene.enabled; checkbox.setAttribute('role', 'switch');
       toggle.append(toggleText, checkbox); form.append(toggle);
-      const save = el('button', 'button button-small button-primary', 'Guardar escena'); save.type = 'submit'; form.append(save);
+      form.append(numberField('Peso', 'weight', scene.weight, 0, 'any'));
+      form.append(categoryField(scene.category));
+      form.append(numberField('Mínimo (s)', 'min_seconds', scene.min_seconds, 1, 'any'));
+      form.append(numberField('Máximo (s)', 'max_seconds', scene.max_seconds, 1, 'any'));
+      const save = el('button', 'button button-small button-primary', 'Guardar ajustes'); save.type = 'submit'; form.append(save);
       details.append(form); card.append(details); grid.append(card);
     });
     updateSceneCurrent();
@@ -248,14 +263,58 @@
       ['#obs-form', 'obs', ['host', 'port']],
       ['#timing-form', 'timing', ['min_seconds', 'max_seconds', 'preferred_seconds', 'memory', 'intensity']],
       ['#manual-form', 'manual', ['policy', 'pause_seconds']],
-      ['#ai-form', 'ai', ['model', 'instructions', 'frequency_seconds', 'timeout_seconds', 'fallback', 'recommend_only']]
+      ['#ai-form', 'ai', ['provider', 'model', 'instructions', 'frequency_seconds', 'timeout_seconds', 'fallback', 'recommend_only']]
     ]) for (const key of keys) setField($(formId), key, config[group]?.[key]);
-    setText('#ai-key-status', config.ai?.has_key ? 'Clave de IA configurada' : 'Sin clave de IA');
+    const chosen = $('#ai-form').elements.provider.value;
+    setText('#ai-key-status', config.ai?.key_status?.[chosen] ? `Clave ${chosen} configurada` : `Sin clave ${chosen}`);
     if (!state.status && config.mode) {
       setText('#mode-indicator', label(config.mode).toUpperCase());
       for (const button of document.querySelectorAll('[data-mode]')) button.classList.toggle('active', button.dataset.mode === config.mode);
     }
   }
+  function chosenAISettings() {
+    const form = $('#ai-form');
+    const model = form.elements.model.value;
+    const selectedBase = form.elements.model.selectedOptions[0]?.dataset.baseUrl || null;
+    const prior = state.config?.ai;
+    return { provider: form.elements.provider.value, model,
+      model_base_url: selectedBase || (prior?.provider === form.elements.provider.value && prior?.model === model ? prior.model_base_url : null),
+      instructions: form.elements.instructions.value,
+      frequency_seconds: formNumber(form, 'frequency_seconds'), timeout_seconds: formNumber(form, 'timeout_seconds'),
+      fallback: form.elements.fallback.value, recommend_only: form.elements.recommend_only.checked };
+  }
+
+  function showModelInfo() {
+    const option = $('#ai-model').selectedOptions[0];
+    const item = state.aiModels.find(model => model.id === option?.value && model.group === option?.dataset.group);
+    if (!item) return;
+    const price = item.input_price == null ? 'precio no publicado' : `$${item.input_price}/M entrada · $${item.output_price ?? '—'}/M salida`;
+    setText('#ai-models-note', `${state.aiCatalogWarning ? state.aiCatalogWarning + ' ' : ''}${item.id} · ${price} · entrada: ${(item.input_modalities || ['text']).join(', ')}. Solo se envían metadatos en esta versión.`);
+  }
+
+  async function loadModels() {
+    const provider = $('#ai-form').elements.provider.value;
+    const current = $('#ai-model').value;
+    const data = await request(`/api/ai/models?provider=${encodeURIComponent(provider)}`);
+    if ($('#ai-form').elements.provider.value !== provider) return;
+    state.aiModels = Array.isArray(data.models) ? data.models : [];
+    const select = $('#ai-model'); select.replaceChildren();
+    if (!state.aiModels.length) select.add(new Option('No se encontraron modelos compatibles', ''));
+    for (const item of state.aiModels) {
+      const cost = item.input_price == null ? '' : ` · $${item.input_price}/M entrada`;
+      const option = new Option(`${item.name} (${item.id})${cost}`, item.id);
+      option.dataset.baseUrl = item.model_base_url || '';
+      option.dataset.group = item.group || '';
+      select.add(option);
+    }
+    if (state.aiModels.some(item => item.id === current)) select.value = current;
+    else if (state.aiModels.some(item => item.id === (state.config?.ai?.model))) select.value = state.config.ai.model;
+    else if (state.aiModels.length) select.value = state.aiModels[0].id;
+    state.aiCatalogWarning = data.warning || '';
+    setText('#ai-models-note', data.warning || `${state.aiModels.length} modelos compatibles · ${data.source === 'account' ? 'catálogo de tu cuenta' : 'catálogo público'}. Los precios son USD por millón de tokens.`);
+    showModelInfo();
+  }
+
   function renderProfiles(data) {
     state.profiles = Array.isArray(data) ? data : Array.isArray(data?.profiles) ? data.profiles : data?.profiles && typeof data.profiles === 'object' ? Object.keys(data.profiles) : [];
     const select = $('#profile-select'); const previous = select.value;
@@ -276,6 +335,7 @@
     const results = await Promise.allSettled([refreshStatus(), refreshScenes(), refreshConfig(), refreshProfiles(), refreshHistory()]);
     const errors = results.filter(result => result.status === 'rejected');
     if (errors.length) showError(errors[0].reason);
+    if (state.config?.ai?.provider === 'opencode' || state.config?.ai?.has_key) loadModels().catch(showError);
   }
 
   function connectWebSocket() {
@@ -328,13 +388,23 @@
       case 'refresh-obs': await request('/api/obs/refresh', { method: 'POST' }); await Promise.all([refreshStatus(), refreshScenes()]); toast('OBS sincronizado.'); break;
       case 'disconnect': await request('/api/obs/disconnect', { method: 'POST' }); await refreshStatus(); toast('OBS desconectado.'); break;
       case 'simulate-obs': await request('/api/obs/connect', { method: 'POST', body: { simulated: true } }); await Promise.all([refreshStatus(), refreshScenes()]); toast('Simulación OBS activada.'); break;
+      case 'refresh-models': await loadModels(); toast('Catálogo de modelos actualizado.'); break;
       case 'test-ai': {
-        const result = await request('/api/ai/test', { method: 'POST' });
-        const target = $('#ai-test-result'); target.hidden = false;
-        target.replaceChildren(el('strong', '', `Recomendación: ${result.scene || '—'}`),
-          el('p', '', result.decision?.reason || 'Sin motivo'),
-          el('small', '', `Duración ${safeNumber(result.decision?.hold_seconds)?.toFixed(1) ?? '—'} s · Confianza ${safeNumber(result.decision?.confidence) ?? '—'} · Latencia ${safeNumber(result.latency) ?? '—'} s · No aplicada`));
-        toast(result?.accepted ? `Prueba de IA correcta: ${result.scene || 'respuesta válida'}. No se aplicó el cambio.` : 'Prueba de IA completada.'); break;
+        const target = $('#ai-test-result');
+        try {
+          await submitConfig('ai', chosenAISettings(), 'Configuración de IA guardada.');
+          const result = await request('/api/ai/test', { method: 'POST' });
+          target.hidden = false;
+          target.replaceChildren(el('strong', '', `Recomendación: ${result.scene || '—'}`),
+            el('p', '', result.decision?.reason || 'Sin motivo'),
+            el('small', '', `Duración ${safeNumber(result.decision?.hold_seconds)?.toFixed(1) ?? '—'} s · Confianza ${safeNumber(result.decision?.confidence) ?? '—'} · Latencia ${safeNumber(result.latency) ?? '—'} s · No aplicada`));
+          toast('Prueba de IA completada: OBS no se ha modificado.');
+        } catch (error) {
+          target.hidden = false;
+          target.replaceChildren(el('strong', '', 'Error de conexión IA'), el('p', '', error.message));
+          throw error;
+        }
+        break;
       }
       case 'simulation': {
         const result = await request('/api/simulation', { method: 'POST', body: { count: 20 } });
@@ -392,22 +462,46 @@
     if (button) busy(button, () => handleAction(button.dataset.action, button));
   });
 
+  document.addEventListener('change', event => {
+    if (event.target.matches('#ai-form select[name="provider"]')) {
+      const provider = event.target.value;
+      const fallback = provider === 'opencode' ? 'deepseek-v4.1-flash' : 'deepseek-flash';
+      state.aiModels = [];
+      $('#ai-model').replaceChildren(new Option(fallback, fallback));
+      setText('#ai-key-status', state.config?.ai?.key_status?.[provider] ? `Clave ${provider} configurada` : `Sin clave ${provider}`);
+      setText('#ai-models-note', 'Selecciona un modelo de este proveedor; guarda los ajustes antes de probar.');
+      if (provider === 'opencode' || state.config?.ai?.key_status?.[provider]) loadModels().catch(showError);
+    }
+    if (event.target.matches('#ai-model')) showModelInfo();
+    if (event.target.matches('[data-scene-form] input[name="enabled"]')) {
+      const checkbox = event.target;
+      const sceneId = checkbox.closest('[data-scene-form]').dataset.sceneForm;
+      const scene = state.scenes.find(item => String(item.id) === sceneId);
+      if (!scene) return;
+      const previous = scene.enabled;
+      checkbox.disabled = true;
+      request(`/api/scenes/${encodeURIComponent(sceneId)}`, { method: 'PUT', body: { enabled: checkbox.checked } })
+        .then(saved => { Object.assign(scene, saved); updateSceneCard(scene); toast(`Escena ${saved.enabled ? 'habilitada' : 'deshabilitada'} y guardada.`); })
+        .catch(error => { checkbox.checked = previous; showError(error); })
+        .finally(() => { checkbox.disabled = false; });
+    }
+  });
+
   document.addEventListener('submit', event => {
     const form = event.target;
     if (!form.matches('#ai-form, #key-form, #obs-form, #timing-form, #manual-form, [data-scene-form]')) return;
     event.preventDefault();
     busy(form.querySelector('[type="submit"]'), async () => {
       if (form.id === 'ai-form') {
-        await submitConfig('ai', {
-          model: form.elements.model.value.trim(), instructions: form.elements.instructions.value,
-          frequency_seconds: formNumber(form, 'frequency_seconds'), timeout_seconds: formNumber(form, 'timeout_seconds'),
-          fallback: form.elements.fallback.value, recommend_only: form.elements.recommend_only.checked
-        }, 'Configuración de IA guardada.');
+        await submitConfig('ai', chosenAISettings(), 'Configuración de IA guardada.');
       } else if (form.id === 'key-form') {
         const key = form.elements.key.value.trim();
         if (!key) throw new Error('Introduce una clave de IA.');
-        await request('/api/ai/key', { method: 'POST', body: { key } });
-        form.reset(); await refreshConfig(); toast('Clave de IA guardada.');
+        const provider = $('#ai-form').elements.provider.value;
+        await submitConfig('ai', chosenAISettings(), 'Proveedor de IA guardado.');
+        await request('/api/ai/key', { method: 'POST', body: { key, provider } });
+        form.reset(); await refreshConfig(); toast(`Clave ${provider} guardada.`);
+        await loadModels();
       } else if (form.id === 'obs-form') {
         const host = form.elements.host.value.trim(); const port = formNumber(form, 'port');
         if (!host || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Host o puerto de OBS no válido.');
@@ -428,11 +522,13 @@
         const sceneId = form.dataset.sceneForm;
         const min_seconds = optionalNumber(form, 'min_seconds'); const max_seconds = optionalNumber(form, 'max_seconds');
         if (min_seconds != null && max_seconds != null && min_seconds > max_seconds) throw new Error('El mínimo de escena no puede superar el máximo.');
-        await request(`/api/scenes/${encodeURIComponent(sceneId)}`, { method: 'PUT', body: {
+        const saved = await request(`/api/scenes/${encodeURIComponent(sceneId)}`, { method: 'PUT', body: {
           enabled: form.elements.enabled.checked, weight: formNumber(form, 'weight'),
           category: form.elements.category.value.trim(), min_seconds, max_seconds
         } });
-        await refreshScenes(); toast('Escena actualizada.');
+        const existing = state.scenes.find(item => String(item.id) === sceneId);
+        if (existing) { Object.assign(existing, saved); updateSceneCard(existing); }
+        toast('Ajustes de escena guardados.');
       }
     });
   });

@@ -1,5 +1,7 @@
 # Informe de entrega — Algunos Indios AI Director
 
+> Este documento corresponde a la primera entrega. La revisión de escenas, OpenCode y servicio Linux se documenta en [`docs/RELEASE_V2.md`](docs/RELEASE_V2.md).
+
 ## Alcance verificado
 
 - Aplicación local FastAPI en `127.0.0.1:8765`, interfaz web sin Node y WebSocket de estado en `/ws/status`.

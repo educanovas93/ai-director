@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import random
 import time
+from urllib.parse import urlparse
 from typing import Any, Literal
 
 import httpx
@@ -58,12 +59,32 @@ class ManualSettings(BaseModel):
     pause_seconds: float = Field(default=30, ge=1, le=3600)
 
 class AISettings(BaseModel):
+    provider: Literal['deepseek', 'opencode'] = 'deepseek'
     model: str = Field(default='deepseek-flash', min_length=1, max_length=100)
+    model_base_url: str | None = None
     instructions: str = Field(default='', max_length=4000)
     frequency_seconds: float = Field(default=12, ge=1, le=3600)
     timeout_seconds: float = Field(default=8, ge=1, le=120)
     fallback: Literal['hold', 'automatic'] = 'automatic'
     recommend_only: bool = False
+
+    @model_validator(mode='after')
+    def safe_endpoint(self):
+        if self.model_base_url is not None:
+            if self.provider != 'opencode' or not allowed_opencode_base(self.model_base_url):
+                raise ValueError('Endpoint OpenCode no permitido')
+        return self
+
+def allowed_opencode_base(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (parsed.scheme == 'https' and parsed.hostname == 'opencode.ai' and port in (None, 443)
+            and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment
+            and (parsed.path in ('/inference/openai/v1', '/inference/go/openai/v1')
+                 or parsed.path.startswith('/inference/custom/conn_')))
 
 class Settings(BaseModel):
     obs: dict[str, Any] = Field(default_factory=lambda: {'host': '127.0.0.1', 'port': 4455})
@@ -190,33 +211,91 @@ def validate_decision(ident: str, registry: Registry, current: str | None):
     return scene
 
 class DeepSeekEngine:
+    """Metadata-only director for DeepSeek or OpenCode's chat-completions API."""
     URL = 'https://api.deepseek.com/chat/completions'
+
     def __init__(self, client: httpx.AsyncClient | None = None):
         self.client = client
         self.latency = None
         self.usage = None
 
+    async def list_models(self, provider: str, key: str, timeout: float = 8):
+        if provider not in ('deepseek', 'opencode'):
+            raise ValueError('Proveedor de IA desconocido')
+        if provider == 'deepseek' and not key:
+            raise ValueError('Introduce primero una API key de DeepSeek')
+        url = ('https://api.deepseek.com/models' if provider == 'deepseek' else
+               'https://opencode.ai/console/api/v1/models' if key else
+               'https://opencode.ai/inference/v1/models')
+        own = self.client is None
+        client = self.client or httpx.AsyncClient(timeout=timeout)
+        try:
+            response = await client.get(url, headers={'Authorization': f'Bearer {key}'} if key else {})
+            response.raise_for_status()
+            raw = response.json()
+            if provider == 'opencode' and key:
+                entries = [(group, model) for group, details in raw.items()
+                           for model in details.get('models', {}).values()]
+            else:
+                entries = [(provider, model) for model in raw.get('data', [])]
+            models = []
+            for group, item in entries:
+                ident = item.get('id', '')
+                if not ident or ident.endswith('-free') or item.get('type', 'chat') != 'chat':
+                    continue
+                api = item.get('api', {}).get('chat-completions', {})
+                base = api.get('base_url')
+                if provider == 'opencode' and not (base and allowed_opencode_base(base)):
+                    continue
+                if provider == 'deepseek':
+                    inputs = item.get('input_modalities', ['text'])
+                    if 'text' not in inputs or 'text' not in item.get('output_modalities', ['text']):
+                        continue
+                else:
+                    inputs = item.get('modalities', {}).get('input', ['text'])
+                cost = item.get('cost', {}).get('text', {})
+                models.append({'id': ident, 'name': item.get('name') or ident,
+                               'model_base_url': base if provider == 'opencode' else None,
+                               'input_modalities': inputs, 'input_price': cost.get('input', {}).get('price'),
+                               'output_price': cost.get('output', {}).get('price'), 'group': group})
+            return {'models': sorted(models, key=lambda model: model['id']),
+                    'source': 'account' if key else 'public',
+                    'warning': None if key else 'Catálogo público: introduce tu clave para consultar los modelos de tu cuenta.'}
+        finally:
+            if own: await client.aclose()
+
     async def decide(self, key: str, model: str, scenes: list[Scene], current: str | None, history: list[str], settings: Settings, instructions: str, timing: Timing | None = None, seconds_since_last_cut: float = 0) -> Decision:
-        if not key: raise ValueError('Falta API key de DeepSeek')
+        provider = settings.ai.provider
+        if not key: raise ValueError(f'Falta API key de {provider}')
         timing = timing or settings.timing
         context = {'mode':settings.active_profile,'current_scene':next((s.name for s in scenes if s.id==current),current),'available_scenes':[{'id':s.id,'name':s.name,'category':s.category,'weight':s.weight} for s in scenes], 'last_scenes':[next((s.name for s in scenes if s.id==ident),ident) for ident in history[-10:]], 'seconds_since_last_cut':round(seconds_since_last_cut,1),'min_seconds':timing.min_seconds,'max_seconds':timing.max_seconds,'user_instructions':instructions}
+        payload = {'model':model,'messages':[{'role':'system','content':'Eres realizador de OBS. Solo dispones de metadatos. Devuelve únicamente JSON con scene, hold_seconds, reason, confidence. Escoge una escena de available_scenes distinta de current_scene. No afirmes observar vídeo ni audio.'},{'role':'user','content':json.dumps(context,ensure_ascii=False)}], 'max_tokens':256,'stream':False}
+        if provider == 'deepseek':
+            url = self.URL
+            payload.update(response_format={'type':'json_object'},thinking={'type':'disabled'})
+        elif provider == 'opencode':
+            base = settings.ai.model_base_url or 'https://opencode.ai/inference/openai/v1'
+            if not allowed_opencode_base(base): raise ValueError('Endpoint OpenCode no permitido')
+            url = base.rstrip('/') + '/chat/completions'
+        else:
+            raise ValueError('Proveedor de IA desconocido')
         own = self.client is None
         client = self.client or httpx.AsyncClient(timeout=settings.ai.timeout_seconds)
         start = time.monotonic()
         try:
-            res = await client.post(self.URL,headers={'Authorization':f'Bearer {key}'},json={'model':model,'messages':[{'role':'system','content':'Eres realizador de OBS. Solo dispones de metadatos. Devuelve únicamente JSON con scene, hold_seconds, reason, confidence. Escoge una escena de available_scenes distinta de current_scene. No afirmes observar vídeo ni audio.'},{'role':'user','content':json.dumps(context,ensure_ascii=False)}], 'response_format':{'type':'json_object'},'max_tokens':256,'thinking':{'type':'disabled'},'stream':False})
+            res = await client.post(url,headers={'Authorization':f'Bearer {key}'},json=payload)
             res.raise_for_status()
-            payload = res.json()
-            self.usage = payload.get('usage')
-            content = payload['choices'][0]['message']['content']
+            response = res.json()
+            self.usage = response.get('usage')
+            content = response['choices'][0]['message']['content']
             answer = AIReply.model_validate_json(content)
             matches = [s for s in scenes if s.id == answer.scene or s.name == answer.scene]
-            if not matches: raise ValueError('DeepSeek propuso escena desconocida')
+            if not matches: raise ValueError(f'{provider} propuso escena desconocida')
             ident = matches[0].id
-            if ident == current or not matches[0].enabled or matches[0].missing: raise ValueError('DeepSeek propuso escena no permitida')
+            if ident == current or not matches[0].enabled or matches[0].missing: raise ValueError(f'{provider} propuso escena no permitida')
             return Decision(scene_id=ident,hold_seconds=max(timing.min_seconds,min(timing.max_seconds,answer.hold_seconds)),reason=answer.reason,confidence=answer.confidence,source='ai')
         except (KeyError, IndexError, TypeError) as exc:
-            raise ValueError('Respuesta DeepSeek incompleta') from exc
+            raise ValueError(f'Respuesta de {provider} incompleta') from exc
         finally:
             self.latency = round(time.monotonic()-start,3)
             if own: await client.aclose()
@@ -291,7 +370,8 @@ class Director:
         self.obs, self.config = obs,config
         self.auto = AutoEngine()
         self.ai = DeepSeekEngine()
-        self.key = os.environ.get('DEEPSEEK_API_KEY','')
+        self.keys = {'deepseek': os.environ.get('DEEPSEEK_API_KEY',''),
+                     'opencode': os.environ.get('OPENCODE_API_KEY','')}
         self.password = os.environ.get('OBS_WEBSOCKET_PASSWORD','')
         self.state = 'stopped'
         self.connected = False
@@ -317,6 +397,14 @@ class Director:
         self._reconnect = None
         self._shutting_down = False
         self.auto_reconnect = True
+
+    @property
+    def key(self):
+        return self.keys.get(self.config.settings.ai.provider, '')
+
+    @key.setter
+    def key(self, value):
+        self.keys[self.config.settings.ai.provider] = value
 
     def _signal(self):
         self._wake.set()
@@ -538,6 +626,7 @@ class Director:
                 validate_decision(choice.scene_id,self.config.registry,current)
                 if choice.hold_seconds < timing.min_seconds or choice.hold_seconds > timing.max_seconds:
                     raise ValueError('Duración fuera de límites')
+                self.error = ''
                 if settings.ai.recommend_only or dry:
                     if not dry and generation == self.generation and self.state == 'running':
                         self.next_at = time.monotonic()+max(timing.min_seconds,settings.ai.frequency_seconds)
@@ -547,7 +636,14 @@ class Director:
                     if not dry: self.record(self.last_decision,choice.reason,'ai',accepted=True,applied=False)
                     return choice
             except Exception as exc:
-                self.error = 'DeepSeek: '+type(exc).__name__
+                if isinstance(exc, httpx.HTTPStatusError):
+                    status = exc.response.status_code
+                    hint = {401:'clave incorrecta para este proveedor',403:'modelo sin acceso o saldo insuficiente',404:'modelo/endpoint inexistente',429:'límite de peticiones'}.get(status,'error del proveedor')
+                    self.error = f'{settings.ai.provider} HTTP {status}: {hint}'
+                elif isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
+                    self.error = f'{settings.ai.provider}: timeout de {settings.ai.timeout_seconds}s; fallback local'
+                else:
+                    self.error = f'{settings.ai.provider}: {type(exc).__name__} (respuesta no válida o escena no permitida)'
                 self.record('(sin escena)','Respuesta IA rechazada: '+type(exc).__name__,'ai',accepted=False,applied=False)
                 log.warning('AI decision rejected: %s',type(exc).__name__)
                 if settings.ai.fallback == 'hold':

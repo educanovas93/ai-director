@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import httpx
 import logging
 import os
+from typing import Literal
 from pathlib import Path
 import socket
 import threading
@@ -35,6 +37,7 @@ class ManualBody(BaseModel):
 
 class KeyBody(BaseModel):
     key: str
+    provider: Literal['deepseek','opencode'] | None = None
 
 class SimulationBody(BaseModel):
     count: int = Field(default=20,ge=1,le=100)
@@ -45,28 +48,28 @@ class ProfileBody(BaseModel):
     source: str | None = None
 
 
-def _secure_store(key: str):
+def _secure_store(key: str, provider: str):
     if os.name == 'nt':
         import keyring
-        keyring.set_password('AlgunosIndiosAIDirector','deepseek',key)
+        keyring.set_password('AlgunosIndiosAIDirector',provider,key)
         return
-    # On other platforms use DEEPSEEK_API_KEY or session-only key; no plaintext fallback.
+    # On other platforms use provider-specific environment variables or session-only keys.
 
 
-def _secure_load():
+def _secure_load(provider: str):
     if os.name == 'nt':
         try:
             import keyring
-            return keyring.get_password('AlgunosIndiosAIDirector','deepseek') or ''
+            return keyring.get_password('AlgunosIndiosAIDirector',provider) or ''
         except Exception as exc:
             log.warning('Credential Manager unavailable: %s',type(exc).__name__)
-    return os.environ.get('DEEPSEEK_API_KEY','')
+    return os.environ.get('OPENCODE_API_KEY' if provider == 'opencode' else 'DEEPSEEK_API_KEY','')
 
 
 def create_app(config_path: Path | None = None):
     config = Configuration(config_path or ROOT/'data'/'settings.json')
     director = Director(RealOBS(), config)
-    director.key = _secure_load()
+    director.keys.update({provider: _secure_load(provider) for provider in ('deepseek','opencode')})
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -87,7 +90,20 @@ def create_app(config_path: Path | None = None):
             return JSONResponse({'detail':'Solo acceso local'},status_code=403)
         return await call_next(request)
 
-    def fail(exc):
+    def fail(exc, provider=None):
+        provider = provider or config.settings.ai.provider
+        label = 'OpenCode' if provider == 'opencode' else 'DeepSeek'
+        if isinstance(exc, httpx.HTTPStatusError):
+            code = exc.response.status_code
+            hints = {401: f'La clave no es válida para {label}. Las claves OpenCode y DeepSeek no son intercambiables.',
+                     403: 'Sin acceso al modelo: revisa saldo/plan. Los modelos -free de OpenCode no funcionan desde clientes externos.',
+                     404: 'Modelo o endpoint desconocido: actualiza la lista de modelos y elige otro.',
+                     429: 'Límite de peticiones o saldo alcanzado: espera o revisa tu cuenta.'}
+            raise HTTPException(502, {'message': f'{label} respondió HTTP {code}', 'provider': provider,
+                                      'status_code': code, 'hint': hints.get(code, 'Comprueba proveedor, modelo y estado del servicio.')})
+        if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
+            raise HTTPException(504, {'message': f'{label}: tiempo de espera agotado', 'provider': provider,
+                                      'hint': 'Aumenta el timeout o usa el modo automático como fallback.'})
         if isinstance(exc, ValidationError): raise HTTPException(422,str(exc))
         log.warning('Operation rejected: %s',type(exc).__name__)
         raise HTTPException(400,str(exc) if isinstance(exc,ValueError) else type(exc).__name__)
@@ -177,18 +193,24 @@ def create_app(config_path: Path | None = None):
 
     @app.get('/api/config')
     async def get_config():
-        return {**config.settings.model_dump(),'ai':{**config.settings.ai.model_dump(),'has_key':bool(director.key)}}
+        return {**config.settings.model_dump(),'ai':{**config.settings.ai.model_dump(),
+                'has_key':bool(director.key),'key_status':{name:bool(value) for name,value in director.keys.items()}}}
 
     @app.put('/api/config')
     async def put_config(body: dict):
         if not set(body) <= {'obs','timing','manual','ai','mode','active_profile'}:
             raise HTTPException(422,'Campo de configuración desconocido')
-        if 'ai' in body and ('key' in body['ai'] or 'has_key' in body['ai']):
+        if 'ai' in body and not isinstance(body['ai'],dict):
+            raise HTTPException(422,'Configuración IA inválida')
+        if 'ai' in body and set(body['ai']) & {'key','api_key','has_key','key_status'}:
             raise HTTPException(422,'Utiliza el endpoint dedicado de credenciales')
         try:
             original = config.settings.model_dump()
             for k,v in body.items():
                 original[k] = {**original[k],**v} if isinstance(v,dict) and isinstance(original[k],dict) else v
+            if 'ai' in body and body['ai'].get('provider',config.settings.ai.provider) != config.settings.ai.provider:
+                original['ai']['model'] = body['ai'].get('model') or ('deepseek-v4.1-flash' if body['ai']['provider']=='opencode' else 'deepseek-flash')
+                original['ai']['model_base_url'] = body['ai'].get('model_base_url')
             new = Settings.model_validate(original)
             if new.active_profile not in config.profiles: raise ValueError('Perfil inexistente')
             config.settings = new
@@ -243,11 +265,19 @@ def create_app(config_path: Path | None = None):
 
     @app.post('/api/ai/key')
     async def ai_key(body: KeyBody):
+        provider = body.provider or config.settings.ai.provider
         try:
-            _secure_store(body.key)
-            director.key = body.key
-            return {'has_key':bool(body.key),'persistent':os.name=='nt'}
-        except Exception as exc: fail(exc)
+            _secure_store(body.key,provider)
+            director.keys[provider] = body.key
+            return {'has_key':bool(body.key),'persistent':os.name=='nt','provider':provider}
+        except Exception as exc: fail(exc,provider)
+
+    @app.get('/api/ai/models')
+    async def ai_models(provider: Literal['deepseek','opencode'] | None = None):
+        selected = provider or config.settings.ai.provider
+        try:
+            return await asyncio.wait_for(director.ai.list_models(selected,director.keys.get(selected,''),config.settings.ai.timeout_seconds),timeout=config.settings.ai.timeout_seconds)
+        except Exception as exc: fail(exc,selected)
 
     @app.post('/api/ai/test')
     async def ai_test():
@@ -295,5 +325,6 @@ if __name__ == '__main__':
                 with socket.create_connection(('127.0.0.1',8765),timeout=.2):
                     webbrowser.open('http://127.0.0.1:8765'); return
             except OSError: time.sleep(.1)
-    threading.Thread(target=open_when_ready,daemon=True).start()
+    if os.environ.get('AI_DIRECTOR_NO_BROWSER') != '1':
+        threading.Thread(target=open_when_ready,daemon=True).start()
     uvicorn.run(create_app(),host='127.0.0.1',port=8765,log_level='info')

@@ -1,0 +1,24 @@
+[Unit]
+Description=Algunos Indios AI Director (panel local OBS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eduardo
+Group=eduardo
+WorkingDirectory=/home/eduardo/empyrean/algunos-indios-ai-director
+Environment=PYTHONPATH=/home/eduardo/empyrean/algunos-indios-ai-director
+Environment=PYTHONUNBUFFERED=1
+Environment=AI_DIRECTOR_NO_BROWSER=1
+ExecStart=/home/eduardo/empyrean/algunos-indios-ai-director/.venv/bin/python -m backend.main
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/eduardo/empyrean/algunos-indios-ai-director/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
