@@ -263,7 +263,7 @@
       ['#obs-form', 'obs', ['host', 'port']],
       ['#timing-form', 'timing', ['min_seconds', 'max_seconds', 'preferred_seconds', 'memory', 'intensity']],
       ['#manual-form', 'manual', ['policy', 'pause_seconds']],
-      ['#ai-form', 'ai', ['provider', 'model', 'instructions', 'frequency_seconds', 'timeout_seconds', 'fallback', 'recommend_only']]
+      ['#ai-form', 'ai', ['provider', 'plan', 'model', 'instructions', 'frequency_seconds', 'timeout_seconds', 'fallback', 'recommend_only']]
     ]) for (const key of keys) setField($(formId), key, config[group]?.[key]);
     const chosen = $('#ai-form').elements.provider.value;
     setText('#ai-key-status', config.ai?.key_status?.[chosen] ? `Clave ${chosen} configurada` : `Sin clave ${chosen}`);
@@ -277,7 +277,7 @@
     const model = form.elements.model.value;
     const selectedBase = form.elements.model.selectedOptions[0]?.dataset.baseUrl || null;
     const prior = state.config?.ai;
-    return { provider: form.elements.provider.value, model,
+    return { provider: form.elements.provider.value, plan: form.elements.plan?.value || 'auto', model,
       model_base_url: selectedBase || (prior?.provider === form.elements.provider.value && prior?.model === model ? prior.model_base_url : null),
       instructions: form.elements.instructions.value,
       frequency_seconds: formNumber(form, 'frequency_seconds'), timeout_seconds: formNumber(form, 'timeout_seconds'),

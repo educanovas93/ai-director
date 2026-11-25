@@ -156,6 +156,7 @@ def create_app(config_path: Path | None = None):
                 upstream = (exc.response.text or '')[:200]
             upstream = ' '.join(upstream.split())[:180]
             hints = {401: f'La clave no es válida para {label}, o pertenece a otro tipo de plan. Las claves OpenCode y DeepSeek no son intercambiables.',
+                     402: 'Saldo insuficiente en la vía de pago por uso. Si tu clave es de suscripción Go, elige «Go (suscripción)» en «Tipo de plan» y vuelve a probar; la app también reintenta sola en la ruta Go.',
                      403: 'Sin acceso al modelo: revisa saldo/plan y si tu clave es Go o Console. Los modelos -free de OpenCode no funcionan desde clientes externos.',
                      404: 'Modelo o endpoint desconocido: actualiza la lista de modelos y elige otro.',
                      429: 'Límite de peticiones o saldo alcanzado: espera o revisa tu cuenta.'}

@@ -61,6 +61,7 @@ class ManualSettings(BaseModel):
 
 class AISettings(BaseModel):
     provider: Literal['deepseek', 'opencode'] = 'deepseek'
+    plan: Literal['auto', 'go', 'payg'] = 'auto'
     model: str = Field(default='deepseek-flash', min_length=1, max_length=100)
     model_base_url: str | None = None
     instructions: str = Field(default='', max_length=4000)
@@ -279,13 +280,21 @@ class DeepSeekEngine:
             payload.update(response_format={'type':'json_object'},thinking={'type':'disabled'})
             headers = {'Authorization':f'Bearer {key}','User-Agent':'algunos-indios-ai-director/1.0'}
         elif provider == 'opencode':
-            base = settings.ai.model_base_url or self.active_base or 'https://opencode.ai/inference/openai/v1'
-            if not allowed_opencode_base(base): raise ValueError('Endpoint OpenCode no permitido')
-            urls = [base.rstrip('/') + '/chat/completions']
-            # Console keys use /inference/openai; Go keys use /inference/go/openai.
-            alternate = ('https://opencode.ai/inference/go/openai/v1' if '/inference/go/' not in base
-                         else 'https://opencode.ai/inference/openai/v1')
-            urls.append(alternate + '/chat/completions')
+            plan = settings.ai.plan
+            console = 'https://opencode.ai/inference/openai/v1'
+            go = 'https://opencode.ai/inference/go/openai/v1'
+            configured = settings.ai.model_base_url
+            if plan == 'go':
+                bases = [configured if configured and '/inference/go/' in configured else go]
+            elif plan == 'payg':
+                bases = [configured if configured and '/inference/custom/' in configured else console]
+            else:
+                bases = [self.active_base or configured or console]
+                alt = go if '/inference/go/' not in bases[0] else console
+                if alt not in bases: bases.append(alt)
+            for base in bases:
+                if not allowed_opencode_base(base): raise ValueError('Endpoint OpenCode no permitido')
+            urls = [base.rstrip('/') + '/chat/completions' for base in bases]
             headers = {'Authorization':f'Bearer {key}',
                        'User-Agent':'algunos-indios-ai-director/1.0',
                        'x-opencode-session':self.session_id}
@@ -299,8 +308,8 @@ class DeepSeekEngine:
             for attempt, url in enumerate(urls):
                 res = await client.post(url,headers=headers,json=payload)
                 attempted.append(url)
-                if res.status_code in (401,403,404) and attempt == 0 and provider == 'opencode':
-                    continue  # A Go key and a Console key live on different paths.
+                if res.status_code in (401,402,403,404) and attempt < len(urls)-1:
+                    continue  # Wrong key type for this billing bucket: try the other OpenCode path.
                 res.raise_for_status()
                 self.active_base = url.rsplit('/chat/completions',1)[0]
                 response = res.json()
