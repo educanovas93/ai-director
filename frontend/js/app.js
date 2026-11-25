@@ -397,7 +397,7 @@
           target.hidden = false;
           target.replaceChildren(el('strong', '', `Recomendación: ${result.scene || '—'}`),
             el('p', '', result.decision?.reason || 'Sin motivo'),
-            el('small', '', `Duración ${safeNumber(result.decision?.hold_seconds)?.toFixed(1) ?? '—'} s · Confianza ${safeNumber(result.decision?.confidence) ?? '—'} · Latencia ${safeNumber(result.latency) ?? '—'} s · No aplicada`));
+            el('small', '', `Duración ${safeNumber(result.decision?.hold_seconds)?.toFixed(1) ?? '—'} s · Confianza ${safeNumber(result.decision?.confidence) ?? '—'} · Latencia ${safeNumber(result.latency) ?? '—'} s · ${result.base_url ? new URL(result.base_url).hostname : 'proveedor'} · No aplicada`));
           toast('Prueba de IA completada: OBS no se ha modificado.');
         } catch (error) {
           target.hidden = false;

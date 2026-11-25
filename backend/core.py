@@ -12,6 +12,7 @@ import random
 import time
 from urllib.parse import urlparse
 from typing import Any, Literal
+import uuid
 
 import httpx
 from pydantic import BaseModel, Field, model_validator
@@ -218,6 +219,9 @@ class DeepSeekEngine:
         self.client = client
         self.latency = None
         self.usage = None
+        self.session_id = uuid.uuid4().hex
+        self.active_base = None
+        self.last_url = None
 
     async def list_models(self, provider: str, key: str, timeout: float = 8):
         if provider not in ('deepseek', 'opencode'):
@@ -271,23 +275,50 @@ class DeepSeekEngine:
         context = {'mode':settings.active_profile,'current_scene':next((s.name for s in scenes if s.id==current),current),'available_scenes':[{'id':s.id,'name':s.name,'category':s.category,'weight':s.weight} for s in scenes], 'last_scenes':[next((s.name for s in scenes if s.id==ident),ident) for ident in history[-10:]], 'seconds_since_last_cut':round(seconds_since_last_cut,1),'min_seconds':timing.min_seconds,'max_seconds':timing.max_seconds,'user_instructions':instructions}
         payload = {'model':model,'messages':[{'role':'system','content':'Eres realizador de OBS. Solo dispones de metadatos. Devuelve únicamente JSON con scene, hold_seconds, reason, confidence. Escoge una escena de available_scenes distinta de current_scene. No afirmes observar vídeo ni audio.'},{'role':'user','content':json.dumps(context,ensure_ascii=False)}], 'max_tokens':256,'stream':False}
         if provider == 'deepseek':
-            url = self.URL
+            urls = [self.URL]
             payload.update(response_format={'type':'json_object'},thinking={'type':'disabled'})
+            headers = {'Authorization':f'Bearer {key}','User-Agent':'algunos-indios-ai-director/1.0'}
         elif provider == 'opencode':
-            base = settings.ai.model_base_url or 'https://opencode.ai/inference/openai/v1'
+            base = settings.ai.model_base_url or self.active_base or 'https://opencode.ai/inference/openai/v1'
             if not allowed_opencode_base(base): raise ValueError('Endpoint OpenCode no permitido')
-            url = base.rstrip('/') + '/chat/completions'
+            urls = [base.rstrip('/') + '/chat/completions']
+            # Console keys use /inference/openai; Go keys use /inference/go/openai.
+            alternate = ('https://opencode.ai/inference/go/openai/v1' if '/inference/go/' not in base
+                         else 'https://opencode.ai/inference/openai/v1')
+            urls.append(alternate + '/chat/completions')
+            headers = {'Authorization':f'Bearer {key}',
+                       'User-Agent':'algunos-indios-ai-director/1.0',
+                       'x-opencode-session':self.session_id}
         else:
             raise ValueError('Proveedor de IA desconocido')
         own = self.client is None
         client = self.client or httpx.AsyncClient(timeout=settings.ai.timeout_seconds)
         start = time.monotonic()
         try:
-            res = await client.post(url,headers={'Authorization':f'Bearer {key}'},json=payload)
-            res.raise_for_status()
-            response = res.json()
+            response, attempted = None, []
+            for attempt, url in enumerate(urls):
+                res = await client.post(url,headers=headers,json=payload)
+                attempted.append(url)
+                if res.status_code in (401,403,404) and attempt == 0 and provider == 'opencode':
+                    continue  # A Go key and a Console key live on different paths.
+                res.raise_for_status()
+                self.active_base = url.rsplit('/chat/completions',1)[0]
+                response = res.json()
+                break
+            self.last_url = attempted[-1] if response is None else attempted[attempt]
             self.usage = response.get('usage')
-            content = response['choices'][0]['message']['content']
+            message = response['choices'][0]['message']
+            content = (message.get('content') or '').strip()
+            if not content and message.get('reasoning_content'):
+                # Thinking consumed the token budget: retry once without reasoning.
+                payload['reasoning_effort'] = 'none'
+                res = await client.post(urls[attempt],headers=headers,json=payload)
+                res.raise_for_status()
+                response = res.json()
+                self.usage = response.get('usage')
+                content = (response['choices'][0]['message'].get('content') or '').strip()
+            if not content:
+                raise ValueError(f'Respuesta vacía de {provider}: el modelo no devolvió JSON (¿thinking agotó max_tokens?)')
             answer = AIReply.model_validate_json(content)
             matches = [s for s in scenes if s.id == answer.scene or s.name == answer.scene]
             if not matches: raise ValueError(f'{provider} propuso escena desconocida')

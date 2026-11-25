@@ -1,26 +1,25 @@
-# Revisión 2 — interfaz, OpenCode y latencia
+# Revisión 2 — interfaz, OpenCode y despliegue en servidor
 
 ## Cambios
 
 - Las tarjetas de escena muestran todos los ajustes sin desplegar. El interruptor habilitar/deshabilitar se guarda inmediatamente por `PUT /api/scenes/{id}` y revierte en caso de error. «Guardar ajustes» conserva la tarjeta y el foco; solo actualiza los campos guardados, sin reconstruir la cuadrícula.
-- Los ajustes no sensibles (escenas, pesos, categorías, tiempos, perfiles, política, modo y proveedor/modelo) se guardan automáticamente en `data/settings.json` y se recuperan al reiniciar. El motor no se reactiva por seguridad. Claves fuera del JSON, en Credential Manager en Windows o solo entorno/sesión en Linux.
-- Selector de proveedor **DeepSeek directo / OpenCode Console**. Una clave OpenCode usa `/inference/openai/v1/chat/completions`, no el endpoint DeepSeek. Catálogo real de modelos, con filtro de modelos `-free` y de protocolos no compatibles; metadatos de modalidad y precios si el proveedor los devuelve. En OpenCode sin clave se muestra el catálogo público, con clave se consulta la cuenta.
-- Diagnóstico seguro: HTTP 401/403/404/429 y timeouts explicados, error persistente en la prueba IA y fallback sin cortes no autorizados. Ni clave ni respuesta bruta del proveedor se escriben en logs o configuración.
-- Instalado y habilitado `ai-director.service` como usuario `eduardo` en `127.0.0.1:8765`; arranque automático del servicio, **sin iniciar cortes**. La aprobación del host se concedió y el servicio respondió HTTP 200.
-- Investigación de latencia, modelos y costes en [`LATENCIA_MODELOS.md`](LATENCIA_MODELOS.md). Audio/vídeo en tiempo real aún no se captura ni analiza: es una propuesta para fase posterior.
+- Los ajustes no sensibles (escenas, pesos, categorías, tiempos, perfiles, política, modo y proveedor/modelo) se guardan automáticamente en `data/settings.json` y se recuperan al reiniciar. El motor no se reactiva por seguridad.
+- Selector de proveedor **DeepSeek directo / OpenCode Console**. Catálogo real de modelos, filtro de `-free` y de protocolos no compatibles, metadatos de modalidad y precio.
+- **Claves OpenCode Go vs Console:** Go vive en `/inference/go/openai/v1` y exige `x-opencode-session`; Console en `/inference/openai/v1`. El motor detecta 401/403/404 en la primera ruta y reintenta en la otra, envía User-Agent propio y sesión estable. Si el modelo gasta `max_tokens` en razonamiento y devuelve contenido vacío, reintenta una vez con `reasoning_effort: none`.
+- Diagnóstico seguro: se muestra estado HTTP + mensaje del proveedor (p. ej. «Invalid credential»), nunca la clave; el mismo resumen se registra en journal.
+- Credenciales en Linux/macOS: `data/.secrets.json` con permisos `0600`, ignorado por Git; las variables de entorno tienen prioridad. En Windows se mantiene Credential Manager.
+- Despliegue: `ai-director.service` como `eduardo`, escucha en `10.208.99.128:8765` y se publica en `http://10.208.99.128/` con una `IngressRoute` de Traefik (namespace `ai-director`). No se alteró ninguna ruta previa del clúster.
+- Investigación de latencia, modelos y costes en [`LATENCIA_MODELOS.md`](LATENCIA_MODELOS.md).
 
 ## Verificación ejecutada
 
-- `PYTHONPATH=. .venv/bin/python -m pytest tests/ -q`: **34 passed**, una advertencia de obsolescencia de `fastapi.testclient`/Starlette, sin errores.
-- `node --check frontend/js/app.js`, `git diff --check` y `systemd-analyze verify deploy/ai-director.service`: sin errores.
-- Navegador real con OBS simulado: cinco tarjetas con ajustes siempre visibles; el interruptor persistió inmediatamente; guardar peso/categoría mantuvo el mismo nodo DOM; catálogo público OpenCode cargó 13 modelos compatibles, incluido `deepseek-v4.1-flash`; a 390 px no hubo desbordamiento horizontal.
-- Petición HTTP real al catálogo público OpenCode: 13 modelos compatibles. Peticiones de decisión con clave OpenCode/DeepSeek y errores 401 simuladas con transporte HTTP; **no** hay clave real disponible en este host, por lo que no se ha medido latencia de inferencia real.
-
-## Servicio verificado
-
-- `systemctl is-enabled` = `enabled`, `is-active` = `active`; puerto 8765 ligado únicamente a `127.0.0.1`. El adaptador simulado devolvió cinco escenas y el director siguió `stopped`; `data/settings.json` fue escrito por `eduardo` con permisos `600`.
+- `PYTHONPATH=. .venv/bin/python -m pytest tests/ -q`: **43 passed**, una advertencia de obsolescencia de `fastapi.testclient`/Starlette.
+- `node --check frontend/js/app.js`, `compileall backend`, `systemd-analyze verify`, `kubectl apply --dry-run=server`: sin errores.
+- `http://10.208.99.128/` responde **HTTP 200** con el panel y WebSocket nativo funcionando a través de Traefik; `http://10.208.99.128:8765/` sigue disponible en la red privada.
+- Prueba con clave ficticia: la API devolvió `502` con `OpenCode respondió HTTP 401` y `Proveedor: «Invalid credential»`, sin filtrar la clave; la clave sobrevivió a un reinicio del servicio (`key_status.opencode = true`) y el fichero quedó `0600`. Después se borró la clave ficticia.
+- OBS simulado: cinco escenas, realización `stopped`.
 
 ## Pendiente
 
-- Prueba con la clave del usuario introducida directamente en el panel (no por chat) para verificar acceso a modelos y latencia real.
-- Validación con OBS real en Windows, especialmente modo estudio y Stream Deck. Las pruebas aquí usan OBS simulado.
+- Introducir la clave real en el panel y comprobar modelo, latencia y coste reales.
+- Validación con OBS real en Windows, especialmente modo estudio y Stream Deck.

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import httpx
+import json
 import logging
 import os
 from typing import Literal
@@ -12,6 +13,7 @@ import socket
 import threading
 import time
 import webbrowser
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -22,6 +24,32 @@ from .core import Configuration, Director, RealOBS, Settings, Scene, validate_de
 
 ROOT = Path(__file__).resolve().parent.parent
 log = logging.getLogger(__name__)
+
+
+def server_bind():
+    """Bind loopback by default; only the explicitly authorized private IP otherwise."""
+    host = os.environ.get('AI_DIRECTOR_BIND_HOST', '127.0.0.1')
+    if host not in {'127.0.0.1', '10.208.99.128'}:
+        raise ValueError('Interfaz no autorizada para AI Director')
+    port = int(os.environ.get('AI_DIRECTOR_PORT', '8765'))
+    if not 1 <= port <= 65535:
+        raise ValueError('Puerto inválido para AI Director')
+    return host, port
+
+
+def authorized_origin(host_header: str, origin: str | None, bind_host: str, allowed_ports: set[int]) -> bool:
+    allowed_hosts = {'localhost', '127.0.0.1'} if bind_host == '127.0.0.1' else {bind_host}
+    try:
+        target = urlsplit('http://' + host_header)
+        target_port = target.port or 80
+        if target.hostname not in allowed_hosts or target_port not in allowed_ports:
+            return False
+        if origin is None:
+            return True  # curl/health checks; browser writes include Origin.
+        source = urlsplit(origin)
+        return source.scheme == 'http' and source.hostname == target.hostname and (source.port or 80) == target_port
+    except ValueError:
+        return False
 
 class ConnectBody(BaseModel):
     host: str | None = None
@@ -48,12 +76,28 @@ class ProfileBody(BaseModel):
     source: str | None = None
 
 
+def _secrets_path() -> Path:
+    return Path(os.environ.get('AI_DIRECTOR_SECRETS_FILE', str(ROOT/'data'/'.secrets.json')))
+
+
 def _secure_store(key: str, provider: str):
     if os.name == 'nt':
         import keyring
         keyring.set_password('AlgunosIndiosAIDirector',provider,key)
         return
-    # On other platforms use provider-specific environment variables or session-only keys.
+    # Linux/macOS: private 0600 file inside the gitignored data/ directory.
+    path = _secrets_path()
+    path.parent.mkdir(parents=True,exist_ok=True)
+    data = {}
+    if path.exists():
+        try: data = json.loads(path.read_text(encoding='utf-8'))
+        except Exception: data = {}
+    data[provider] = key
+    temp = path.with_suffix('.tmp')
+    temp.write_text(json.dumps(data),encoding='utf-8')
+    os.chmod(temp,0o600)
+    os.replace(temp,path)
+    os.chmod(path,0o600)
 
 
 def _secure_load(provider: str):
@@ -63,10 +107,22 @@ def _secure_load(provider: str):
             return keyring.get_password('AlgunosIndiosAIDirector',provider) or ''
         except Exception as exc:
             log.warning('Credential Manager unavailable: %s',type(exc).__name__)
-    return os.environ.get('OPENCODE_API_KEY' if provider == 'opencode' else 'DEEPSEEK_API_KEY','')
+    env = os.environ.get('OPENCODE_API_KEY' if provider == 'opencode' else 'DEEPSEEK_API_KEY','')
+    if env: return env
+    path = _secrets_path()
+    try:
+        return (json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}).get(provider,'')
+    except Exception:
+        log.warning('Stored credential unreadable for %s',provider)
+        return ''
 
 
 def create_app(config_path: Path | None = None):
+    bind_host, bind_port = server_bind()
+    public_port = int(os.environ.get('AI_DIRECTOR_PUBLIC_PORT', str(bind_port)))
+    if public_port != bind_port and (bind_host != '10.208.99.128' or public_port != 80):
+        raise ValueError('Puerto público no autorizado')
+    allowed_ports = {bind_port, public_port}
     config = Configuration(config_path or ROOT/'data'/'settings.json')
     director = Director(RealOBS(), config)
     director.keys.update({provider: _secure_load(provider) for provider in ('deepseek','opencode')})
@@ -83,11 +139,8 @@ def create_app(config_path: Path | None = None):
     @app.middleware('http')
     async def localhost_guard(request: Request, call_next):
         from fastapi.responses import JSONResponse
-        host = request.headers.get('host','').split(':')[0].lower()
-        origin = request.headers.get('origin')
-        allowed = {'127.0.0.1','localhost','[::1]','::1'}
-        if host not in allowed or (origin and origin.rstrip('/').split('://')[-1].split(':')[0].lower() not in allowed):
-            return JSONResponse({'detail':'Solo acceso local'},status_code=403)
+        if not authorized_origin(request.headers.get('host',''),request.headers.get('origin'),bind_host,allowed_ports):
+            return JSONResponse({'detail':'Origen o host no autorizado'},status_code=403)
         return await call_next(request)
 
     def fail(exc, provider=None):
@@ -95,12 +148,22 @@ def create_app(config_path: Path | None = None):
         label = 'OpenCode' if provider == 'opencode' else 'DeepSeek'
         if isinstance(exc, httpx.HTTPStatusError):
             code = exc.response.status_code
-            hints = {401: f'La clave no es válida para {label}. Las claves OpenCode y DeepSeek no son intercambiables.',
-                     403: 'Sin acceso al modelo: revisa saldo/plan. Los modelos -free de OpenCode no funcionan desde clientes externos.',
+            upstream = ''
+            try:
+                data = exc.response.json()
+                upstream = str((data.get('error') or {}).get('message') or data.get('message') or '')
+            except Exception:
+                upstream = (exc.response.text or '')[:200]
+            upstream = ' '.join(upstream.split())[:180]
+            hints = {401: f'La clave no es válida para {label}, o pertenece a otro tipo de plan. Las claves OpenCode y DeepSeek no son intercambiables.',
+                     403: 'Sin acceso al modelo: revisa saldo/plan y si tu clave es Go o Console. Los modelos -free de OpenCode no funcionan desde clientes externos.',
                      404: 'Modelo o endpoint desconocido: actualiza la lista de modelos y elige otro.',
                      429: 'Límite de peticiones o saldo alcanzado: espera o revisa tu cuenta.'}
+            hint = hints.get(code, 'Comprueba proveedor, modelo y estado del servicio.')
+            if upstream: hint += f' Proveedor: «{upstream}»'
+            log.warning('AI upstream HTTP %s (%s): %s',code,provider,upstream[:120] or 'sin mensaje')
             raise HTTPException(502, {'message': f'{label} respondió HTTP {code}', 'provider': provider,
-                                      'status_code': code, 'hint': hints.get(code, 'Comprueba proveedor, modelo y estado del servicio.')})
+                                      'status_code': code, 'hint': hint})
         if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
             raise HTTPException(504, {'message': f'{label}: tiempo de espera agotado', 'provider': provider,
                                       'hint': 'Aumenta el timeout o usa el modo automático como fallback.'})
@@ -288,7 +351,7 @@ def create_app(config_path: Path | None = None):
             result = await asyncio.wait_for(director.ai.decide(director.key,cfg.ai.model,available,director.current,list(director.history),cfg,cfg.ai.instructions,config.effective_timing(),time.monotonic()-(director.last_cut_at or time.monotonic())),timeout=cfg.ai.timeout_seconds)
             validate_decision(result.scene_id,config.registry,director.current)
             director.record(config.registry.name_for(result.scene_id),result.reason,'ai-test',applied=False)
-            return {'accepted':True,'applied':False,'scene':config.registry.name_for(result.scene_id),'decision':result.model_dump(),'latency':director.ai.latency,'usage':director.ai.usage}
+            return {'accepted':True,'applied':False,'scene':config.registry.name_for(result.scene_id),'decision':result.model_dump(),'latency':director.ai.latency,'usage':director.ai.usage,'base_url':director.ai.last_url}
         except Exception as exc:
             director.record('(sin escena)','Prueba IA rechazada: '+type(exc).__name__,'ai-test',accepted=False)
             fail(exc)
@@ -298,9 +361,7 @@ def create_app(config_path: Path | None = None):
 
     @app.websocket('/ws/status')
     async def ws_status(ws: WebSocket):
-        host = ws.headers.get('host','').split(':')[0].lower()
-        origin = ws.headers.get('origin','').rstrip('/').split('://')[-1].split(':')[0].lower()
-        if host not in {'127.0.0.1','localhost'} or origin not in {'127.0.0.1','localhost'}:
+        if not authorized_origin(ws.headers.get('host',''),ws.headers.get('origin'),bind_host,allowed_ports):
             await ws.close(code=1008); return
         await ws.accept()
         try:
@@ -319,12 +380,13 @@ def create_app(config_path: Path | None = None):
 if __name__ == '__main__':
     import uvicorn
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)s %(message)s')
+    host, port = server_bind()
     def open_when_ready():
         for _ in range(100):
             try:
-                with socket.create_connection(('127.0.0.1',8765),timeout=.2):
-                    webbrowser.open('http://127.0.0.1:8765'); return
+                with socket.create_connection((host,port),timeout=.2):
+                    webbrowser.open(f'http://{host}:{port}/'); return
             except OSError: time.sleep(.1)
     if os.environ.get('AI_DIRECTOR_NO_BROWSER') != '1':
         threading.Thread(target=open_when_ready,daemon=True).start()
-    uvicorn.run(create_app(),host='127.0.0.1',port=8765,log_level='info')
+    uvicorn.run(create_app(),host=host,port=port,log_level='info')
