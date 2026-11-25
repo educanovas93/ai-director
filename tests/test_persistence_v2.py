@@ -11,9 +11,9 @@ def test_scene_toggle_and_provider_survive_restart_without_auto_start(tmp_path):
         assert c.post('/api/obs/connect',json={'simulated':True}).status_code==200
         assert c.put('/api/scenes/sim-2',json={'enabled':False}).status_code==200
         assert c.put('/api/config',json={'ai':{'provider':'opencode','model':'deepseek-v4.1-flash','model_base_url':'https://opencode.ai/inference/openai/v1'}}).status_code==200
-        assert c.post('/api/ai/key',json={'provider':'opencode','key':'session-secret-123'}).status_code==200
-        assert 'session-secret-123' not in c.get('/api/config').text
-        assert 'session-secret-123' not in path.read_text()
+        assert c.post('/api/ai/key',json={'provider':'opencode','key':'session-secret-1234567890'}).status_code==200
+        assert 'session-secret-1234567890' not in c.get('/api/config').text
+        assert 'session-secret-1234567890' not in path.read_text()
     fresh=create_app(path)
     with TestClient(fresh,base_url='http://127.0.0.1:8765') as c:
         assert c.get('/api/status').json()['state']=='stopped'

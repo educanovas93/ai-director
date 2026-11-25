@@ -64,7 +64,7 @@ class ManualBody(BaseModel):
     scene_id: str
 
 class KeyBody(BaseModel):
-    key: str
+    key: str = Field(max_length=500)
     provider: Literal['deepseek','opencode'] | None = None
 
 class SimulationBody(BaseModel):
@@ -258,7 +258,7 @@ def create_app(config_path: Path | None = None):
     @app.get('/api/config')
     async def get_config():
         return {**config.settings.model_dump(),'ai':{**config.settings.ai.model_dump(),
-                'has_key':bool(director.key),'key_status':{name:bool(value) for name,value in director.keys.items()}}}
+                'has_key':bool(runtime_key(config.settings.ai.provider)),'key_status':{name:bool(runtime_key(name)) for name in ('deepseek','opencode')}}}
 
     @app.put('/api/config')
     async def put_config(body: dict):
@@ -330,17 +330,29 @@ def create_app(config_path: Path | None = None):
     @app.post('/api/ai/key')
     async def ai_key(body: KeyBody):
         provider = body.provider or config.settings.ai.provider
+        key = body.key.strip()
+        if len(key) < 20:
+            raise HTTPException(422, {'message':'La clave parece incompleta', 'hint':'Copia la clave completa desde la consola de OpenCode/DeepSeek.'})
         try:
-            _secure_store(body.key,provider)
-            director.keys[provider] = body.key
-            return {'has_key':bool(body.key),'persistent':os.name=='nt','provider':provider}
+            _secure_store(key,provider)
+            director.keys[provider] = key
+            return {'has_key':True,'persistent':os.name=='nt','provider':provider,'length':len(key)}
         except Exception as exc: fail(exc,provider)
+
+    def runtime_key(provider: str) -> str:
+        """Use memory first, then the stored file (e.g. saved before a restart)."""
+        if director.keys.get(provider):
+            return director.keys[provider]
+        stored = _secure_load(provider)
+        if stored:
+            director.keys[provider] = stored
+        return stored
 
     @app.get('/api/ai/models')
     async def ai_models(provider: Literal['deepseek','opencode'] | None = None):
         selected = provider or config.settings.ai.provider
         try:
-            return await asyncio.wait_for(director.ai.list_models(selected,director.keys.get(selected,''),config.settings.ai.timeout_seconds),timeout=config.settings.ai.timeout_seconds)
+            return await asyncio.wait_for(director.ai.list_models(selected,runtime_key(selected),config.settings.ai.timeout_seconds),timeout=config.settings.ai.timeout_seconds)
         except Exception as exc: fail(exc,selected)
 
     @app.post('/api/ai/test')
@@ -349,7 +361,7 @@ def create_app(config_path: Path | None = None):
             cfg = config.settings
             available = config.registry.available()
             if not available: raise ValueError('No hay escenas disponibles')
-            result = await asyncio.wait_for(director.ai.decide(director.key,cfg.ai.model,available,director.current,list(director.history),cfg,cfg.ai.instructions,config.effective_timing(),time.monotonic()-(director.last_cut_at or time.monotonic())),timeout=cfg.ai.timeout_seconds)
+            result = await asyncio.wait_for(director.ai.decide(runtime_key(cfg.ai.provider),cfg.ai.model,available,director.current,list(director.history),cfg,cfg.ai.instructions,config.effective_timing(),time.monotonic()-(director.last_cut_at or time.monotonic())),timeout=cfg.ai.timeout_seconds)
             validate_decision(result.scene_id,config.registry,director.current)
             director.record(config.registry.name_for(result.scene_id),result.reason,'ai-test',applied=False)
             return {'accepted':True,'applied':False,'scene':config.registry.name_for(result.scene_id),'decision':result.model_dump(),'latency':director.ai.latency,'usage':director.ai.usage,'base_url':director.ai.last_url}
